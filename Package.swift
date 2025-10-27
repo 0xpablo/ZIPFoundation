@@ -1,10 +1,10 @@
-// swift-tools-version:5.7
+// swift-tools-version:5.9
 import PackageDescription
 
 let package = Package(
     name: "ZIPFoundation",
     platforms: [
-        .macOS(.v10_15), .iOS(.v12), .tvOS(.v12), .watchOS(.v4),
+        .macOS(.v14), .iOS(.v17), .tvOS(.v17), .watchOS(.v10),
     ],
     products: [
         .library(name: "ZIPFoundation", targets: ["ZIPFoundation"]),
