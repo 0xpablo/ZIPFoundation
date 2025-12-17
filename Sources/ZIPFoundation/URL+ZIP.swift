@@ -24,4 +24,10 @@ extension URL {
         return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(
             ProcessInfo.processInfo.globallyUniqueString)
     }
+
+    /// A file URL representing the root of the local filesystem (`/`).
+    /// Can be used to indicate that symlinks may point anywhere on the filesystem during extraction.
+    public static var rootFS: URL {
+        URL(fileURLWithPath: "/")
+    }
 }

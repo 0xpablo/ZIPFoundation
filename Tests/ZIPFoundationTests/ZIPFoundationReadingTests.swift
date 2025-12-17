@@ -290,4 +290,15 @@ extension ZIPFoundationTests {
         XCTAssertCocoaError(try fileManager.unzipItem(at: archive.url, to: destinationURL),
                             throwsErrorWithCode: .fileReadInvalidFileName)
     }
+
+    func testInvalidSymlinkCompressionMethodErrorConditions() {
+        let archive = self.archive(for: #function, mode: .read)
+        guard let entry = archive["symlink"] else {
+            XCTFail("Missing entry in test archive")
+            return
+        }
+
+        XCTAssertSwiftError(try archive.extract(entry, consumer: { (_) in }),
+                            throws: Archive.ArchiveError.invalidCompressionMethod)
+    }
 }

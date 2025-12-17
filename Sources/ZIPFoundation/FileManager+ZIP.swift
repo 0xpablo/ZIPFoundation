@@ -87,12 +87,13 @@ extension FileManager {
     ///   - sourceURL: The file URL pointing to an existing ZIP file.
     ///   - destinationURL: The file URL that identifies the destination directory of the unzip operation.
     ///   - skipCRC32: Optional flag to skip calculation of the CRC32 checksum to improve performance.
-    ///   - allowUncontainedSymlinks: Optional flag to allow symlinks that point to paths outside the destination.
+    ///   - symlinksValidWithin: Any symlink target that resolves outside this URL is rejected for security reasons.
+    ///                          Pass `.rootFS` to allow symlinks to point anywhere on the filesystem.
     ///   - progress: A progress object that can be used to track or cancel the unzip operation.
     ///   - pathEncoding: Encoding for entry paths. Overrides the encoding specified in the archive.
     /// - Throws: Throws an error if the source item does not exist or the destination URL is not writable.
     public func unzipItem(at sourceURL: URL, to destinationURL: URL,
-                          skipCRC32: Bool = false, allowUncontainedSymlinks: Bool = false,
+                          skipCRC32: Bool = false, symlinksValidWithin: URL? = nil,
                           progress: Progress? = nil, pathEncoding: String.Encoding? = nil) throws {
         let fileManager = FileManager()
         guard fileManager.itemExists(at: sourceURL) else {
@@ -100,6 +101,7 @@ extension FileManager {
         }
         let archive = try Archive(url: sourceURL, accessMode: .read, pathEncoding: pathEncoding)
         var totalUnitCount = Int64(0)
+        let symlinksValidWithin = symlinksValidWithin ?? destinationURL
         if let progress = progress {
             totalUnitCount = archive.reduce(0, { $0 + archive.totalUnitCountForReading($1) })
             progress.totalUnitCount = totalUnitCount
@@ -117,11 +119,13 @@ extension FileManager {
                 let entryProgress = archive.makeProgressForReading(entry)
                 progress.addChild(entryProgress, withPendingUnitCount: entryProgress.totalUnitCount)
                 crc32 = try archive.extract(entry, to: entryURL,
-                                            skipCRC32: skipCRC32, allowUncontainedSymlinks: allowUncontainedSymlinks,
+                                            skipCRC32: skipCRC32,
+                                            symlinksValidWithin: symlinksValidWithin,
                                             progress: entryProgress)
             } else {
                 crc32 = try archive.extract(entry, to: entryURL,
-                                            skipCRC32: skipCRC32, allowUncontainedSymlinks: allowUncontainedSymlinks)
+                                            skipCRC32: skipCRC32,
+                                            symlinksValidWithin: symlinksValidWithin)
             }
 
             func verifyChecksumIfNecessary() throws {

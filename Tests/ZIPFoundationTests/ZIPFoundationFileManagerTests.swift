@@ -158,7 +158,7 @@ extension ZIPFoundationTests {
                                   provider: { (_, _) -> Data in
             return Data(linkTarget.utf8)
         })
-        try? fileManager.unzipItem(at: linkArchiveURL, to: destinationURL, allowUncontainedSymlinks: true)
+        try? fileManager.unzipItem(at: linkArchiveURL, to: destinationURL, symlinksValidWithin: URL.rootFS)
         XCTAssert(fileManager.itemExists(at: destinationURL.appendingPathComponent("link")))
     }
 
