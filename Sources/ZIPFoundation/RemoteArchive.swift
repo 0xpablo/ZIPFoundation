@@ -125,100 +125,35 @@ public struct RemoteArchive {
 
         let localHeaderOffset = entry.localHeaderOffset
         guard localHeaderOffset <= source.size else { throw Archive.ArchiveError.invalidLocalHeaderDataOffset }
-
-        // Single-request extraction:
-        // Start streaming at the Local File Header offset, parse header fields from the stream, then consume exactly
-        // the entry's compressed bytes. The underlying networking layer should cancel the request when the stream is
-        // terminated early.
-        let remainingBytes = source.size - localHeaderOffset
-        guard remainingBytes <= UInt64(Int.max) else { throw Archive.ArchiveError.invalidEntrySize }
-        var iterator = try await source.stream(offset: localHeaderOffset,
-                                               length: Int(remainingBytes),
-                                               chunkSize: bufferSize).makeAsyncIterator()
-        var buffer = Data()
-
-        func fillBufferIfNeeded() async throws {
-            if buffer.isEmpty {
-                guard let next = try await iterator.next() else { throw Archive.ArchiveError.unreadableArchive }
-                buffer.append(next)
-            }
-        }
-
-        func readExactly(_ count: Int) async throws -> Data {
-            var result = Data()
-            result.reserveCapacity(count)
-            var remaining = count
-            while remaining > 0 {
-                try await fillBufferIfNeeded()
-                let take = Swift.min(remaining, buffer.count)
-                result.append(buffer.prefix(take))
-                buffer.removeFirst(take)
-                remaining -= take
-            }
-            return result
-        }
-
-        func discardExactly(_ count: Int) async throws {
-            var remaining = count
-            while remaining > 0 {
-                try await fillBufferIfNeeded()
-                let take = Swift.min(remaining, buffer.count)
-                buffer.removeFirst(take)
-                remaining -= take
-            }
-        }
-
-        let fixedHeader = try await readExactly(Entry.LocalFileHeader.size)
+        // Remote extraction should not rely on cancellation of a "stream-to-EOF" request.
+        // Instead, read the fixed Local File Header fields (30 bytes) to compute the entry's data offset, then
+        // stream exactly `compressedSize` bytes starting at that offset. This matches the intended request pattern:
+        // 1) tiny read for local header, 2) streamed request for entry payload.
+        let fixedHeader = try await source.read(offset: localHeaderOffset, length: Entry.LocalFileHeader.size)
+        guard fixedHeader.count == Entry.LocalFileHeader.size else { throw Archive.ArchiveError.unreadableArchive }
         let localSignature: UInt32 = fixedHeader.scanValue(start: 0)
         guard localSignature == UInt32(localFileHeaderStructSignature) else { throw Archive.ArchiveError.unreadableArchive }
 
         let fileNameLength: UInt16 = fixedHeader.scanValue(start: 26)
         let extraFieldLength: UInt16 = fixedHeader.scanValue(start: 28)
-        let variableHeaderSize = Int(fileNameLength) + Int(extraFieldLength)
-        try await discardExactly(variableHeaderSize)
+
+        let dataOffset = localHeaderOffset
+            + UInt64(Entry.LocalFileHeader.size)
+            + UInt64(fileNameLength)
+            + UInt64(extraFieldLength)
+        guard dataOffset <= source.size else { throw Archive.ArchiveError.invalidLocalHeaderDataOffset }
 
         let compressedSize = entry.compressedSize
         guard compressedSize <= UInt64(Int.max) else { throw Archive.ArchiveError.invalidEntrySize }
         let compressedLength = Int(compressedSize)
-
-        struct SliceSequence: AsyncSequence {
-            typealias Element = Data
-            struct AsyncIterator: AsyncIteratorProtocol {
-                var upstream: AsyncThrowingStream<Data, Error>.AsyncIterator
-                var buffer: Data
-                var remaining: Int
-                let chunkSize: Int
-
-                mutating func next() async throws -> Data? {
-                    guard remaining > 0 else { return nil }
-                    if buffer.isEmpty {
-                        guard let next = try await upstream.next() else { throw Archive.ArchiveError.unreadableArchive }
-                        buffer.append(next)
-                    }
-                    let take = Swift.min(remaining, Swift.min(chunkSize, buffer.count))
-                    let chunk = Data(buffer.prefix(take))
-                    buffer.removeFirst(take)
-                    remaining -= take
-                    return chunk
-                }
-            }
-
-            let upstream: AsyncThrowingStream<Data, Error>.AsyncIterator
-            let buffer: Data
-            let remaining: Int
-            let chunkSize: Int
-
-            func makeAsyncIterator() -> AsyncIterator {
-                AsyncIterator(upstream: upstream, buffer: buffer, remaining: remaining, chunkSize: chunkSize)
-            }
-        }
+        let compressedStream = try await source.stream(offset: dataOffset,
+                                                       length: compressedLength,
+                                                       chunkSize: bufferSize)
 
         if cds.compressionMethod == CompressionMethod.none.rawValue {
             var bytesWritten: UInt64 = 0
             var crc32 = CRC32(0)
-            var dataIterator = SliceSequence(upstream: iterator, buffer: buffer, remaining: compressedLength, chunkSize: bufferSize)
-                .makeAsyncIterator()
-            while let chunk = try await dataIterator.next() {
+            for try await chunk in compressedStream {
                 bytesWritten += UInt64(chunk.count)
                 if !skipCRC32 { crc32 = chunk.crc32(checksum: crc32) }
                 try await consumer(chunk)
@@ -237,10 +172,6 @@ public struct RemoteArchive {
             func add(_ bytes: Int) { value += UInt64(bytes) }
         }
         let bytesWritten = BytesWritten()
-        let compressedStream = SliceSequence(upstream: iterator,
-                                             buffer: buffer,
-                                             remaining: compressedLength,
-                                             chunkSize: bufferSize)
         let crc32 = try await Data.decompress(bufferSize: bufferSize,
                                               skipCRC32: skipCRC32,
                                               stream: compressedStream) { data in
@@ -264,7 +195,9 @@ public struct RemoteArchive {
                 do {
                     try await self.extract(entry, bufferSize: bufferSize, skipCRC32: skipCRC32) { chunk in
                         try Task.checkCancellation()
-                        continuation.yield(chunk)
+                        // `chunk` can be backed by a reused scratch buffer (e.g. `Data(bytesNoCopy: ...)`).
+                        // Ensure we copy so yielded values remain stable after this closure returns.
+                        continuation.yield(Data(chunk))
                     }
                     continuation.finish()
                 } catch {

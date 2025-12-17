@@ -135,13 +135,26 @@ extension ZIPFoundationTests {
 
                 XCTAssertEqual(actual, expected)
 
-                // Extraction should use a single streamed request starting at the local header offset (no extra reads).
+                // Extraction should perform one small read for the local header fixed fields, and one streamed request
+                // for the entry's compressed payload.
                 let snapshotAfterExtract = await source.snapshot()
-                XCTAssertEqual(snapshotAfterExtract.reads.count, readsAfterOpen)
+                XCTAssertEqual(snapshotAfterExtract.reads.count, readsAfterOpen + 1)
                 XCTAssertEqual(snapshotAfterExtract.streams.count, streamsAfterOpen + 1)
+
+                let localHeaderOffset = cdEntry.localHeaderOffset
+                let fixedHeader = archiveData.subdata(in: Int(localHeaderOffset)..<Int(localHeaderOffset) + Entry.LocalFileHeader.size)
+                let fileNameLength: UInt16 = fixedHeader.scanValue(start: 26)
+                let extraFieldLength: UInt16 = fixedHeader.scanValue(start: 28)
+                let dataOffset = localHeaderOffset
+                    + UInt64(Entry.LocalFileHeader.size)
+                    + UInt64(fileNameLength)
+                    + UInt64(extraFieldLength)
+                let compressedLength = Int(cdEntry.compressedSize)
+
+                XCTAssertTrue(snapshotAfterExtract.reads.contains { $0.offset == localHeaderOffset && $0.length == Entry.LocalFileHeader.size })
                 XCTAssertTrue(snapshotAfterExtract.streams.dropFirst(streamsAfterOpen).contains {
-                    $0.offset == cdEntry.localHeaderOffset
-                    && $0.length == Int(source.size - cdEntry.localHeaderOffset)
+                    $0.offset == dataOffset
+                    && $0.length == compressedLength
                 })
             } catch {
                 XCTFail("Unexpected error: \(error)")
