@@ -73,7 +73,11 @@ public struct RemoteArchive {
 
         let tailLength = Int(Swift.min(UInt64(maxDirectoryEndOffset), archiveSize))
         let tailOffset = archiveSize - UInt64(tailLength)
-        let tailData = try await source.read(offset: tailOffset, length: tailLength)
+        let tailData = try await RemoteArchive.readExactly(
+            source: source,
+            offset: tailOffset,
+            length: tailLength
+        )
 
         guard let (eocd, eocdOffset) = Archive.scanForEndOfCentralDirectoryRecord(in: tailData,
                                                                                   dataOffset: tailOffset,
@@ -100,7 +104,11 @@ public struct RemoteArchive {
         guard cdOffset <= archiveSize else { throw Archive.ArchiveError.invalidCentralDirectoryOffset }
         guard cdSize <= UInt64(Int.max) else { throw Archive.ArchiveError.invalidCentralDirectorySize }
 
-        let centralDirectoryData = try await source.read(offset: cdOffset, length: Int(cdSize))
+        let centralDirectoryData = try await RemoteArchive.readExactly(
+            source: source,
+            offset: cdOffset,
+            length: Int(cdSize)
+        )
         guard centralDirectoryData.count == Int(cdSize) else { throw Archive.ArchiveError.unreadableArchive }
         self.centralDirectoryEntries = try RemoteArchive.parseCentralDirectory(data: centralDirectoryData,
                                                                                expectedEntryCount: entryCount,
@@ -115,6 +123,8 @@ public struct RemoteArchive {
                         bufferSize: Int = defaultReadChunkSize,
                         skipCRC32: Bool = false,
                         consumer: @Sendable (Data) async throws -> Void) async throws {
+        guard bufferSize > 0 else { throw Archive.ArchiveError.invalidBufferSize }
+
         let cds = entry.centralDirectoryStructure
         guard !cds.isEncrypted else { throw Archive.ArchiveError.unreadableArchive }
 
@@ -129,7 +139,11 @@ public struct RemoteArchive {
         // Instead, read the fixed Local File Header fields (30 bytes) to compute the entry's data offset, then
         // stream exactly `compressedSize` bytes starting at that offset. This matches the intended request pattern:
         // 1) tiny read for local header, 2) streamed request for entry payload.
-        let fixedHeader = try await source.read(offset: localHeaderOffset, length: Entry.LocalFileHeader.size)
+        let fixedHeader = try await RemoteArchive.readExactly(
+            source: source,
+            offset: localHeaderOffset,
+            length: Entry.LocalFileHeader.size
+        )
         guard fixedHeader.count == Entry.LocalFileHeader.size else { throw Archive.ArchiveError.unreadableArchive }
         let localSignature: UInt32 = fixedHeader.scanValue(start: 0)
         guard localSignature == UInt32(localFileHeaderStructSignature) else { throw Archive.ArchiveError.unreadableArchive }
@@ -137,11 +151,21 @@ public struct RemoteArchive {
         let fileNameLength: UInt16 = fixedHeader.scanValue(start: 26)
         let extraFieldLength: UInt16 = fixedHeader.scanValue(start: 28)
 
-        let dataOffset = localHeaderOffset
-            + UInt64(Entry.LocalFileHeader.size)
-            + UInt64(fileNameLength)
-            + UInt64(extraFieldLength)
-        guard dataOffset <= source.size else { throw Archive.ArchiveError.invalidLocalHeaderDataOffset }
+        let (offsetAfterFixedHeader, fixedHeaderOverflow) = localHeaderOffset.addingReportingOverflow(
+            UInt64(Entry.LocalFileHeader.size)
+        )
+        let (offsetAfterFileName, fileNameOverflow) = offsetAfterFixedHeader.addingReportingOverflow(
+            UInt64(fileNameLength)
+        )
+        let (dataOffset, extraFieldOverflow) = offsetAfterFileName.addingReportingOverflow(
+            UInt64(extraFieldLength)
+        )
+        guard !fixedHeaderOverflow,
+              !fileNameOverflow,
+              !extraFieldOverflow,
+              dataOffset <= source.size else {
+            throw Archive.ArchiveError.invalidLocalHeaderDataOffset
+        }
 
         let compressedSize = entry.compressedSize
         guard compressedSize <= UInt64(Int.max) else { throw Archive.ArchiveError.invalidEntrySize }
@@ -194,10 +218,24 @@ public struct RemoteArchive {
             let task = Task {
                 do {
                     try await self.extract(entry, bufferSize: bufferSize, skipCRC32: skipCRC32) { chunk in
-                        try Task.checkCancellation()
                         // `chunk` can be backed by a reused scratch buffer (e.g. `Data(bytesNoCopy: ...)`).
                         // Ensure we copy so yielded values remain stable after this closure returns.
-                        continuation.yield(Data(chunk))
+                        let stableChunk = Data(chunk)
+                        while true {
+                            try Task.checkCancellation()
+                            switch continuation.yield(stableChunk) {
+                            case .enqueued:
+                                return
+                            case .dropped:
+                                // `bufferingOldest(1)` drops the offered chunk while the previous chunk is pending.
+                                // Retry cooperatively so a slow consumer applies backpressure instead of losing data.
+                                await Task<Never, Never>.yield()
+                            case .terminated:
+                                throw CancellationError()
+                            @unknown default:
+                                throw CancellationError()
+                            }
+                        }
                     }
                     continuation.finish()
                 } catch {
@@ -210,6 +248,25 @@ public struct RemoteArchive {
 }
 
 private extension RemoteArchive {
+    static func readExactly(source: any AsyncArchiveByteSource,
+                            offset: UInt64,
+                            length: Int) async throws -> Data {
+        guard length >= 0 else { throw Archive.ArchiveError.unreadableArchive }
+
+        var result = Data()
+        while result.count < length {
+            let remainingLength = length - result.count
+            let (readOffset, overflow) = offset.addingReportingOverflow(UInt64(result.count))
+            guard !overflow else { throw Archive.ArchiveError.unreadableArchive }
+
+            let chunk = try await source.read(offset: readOffset, length: remainingLength)
+            guard !chunk.isEmpty else { break }
+            guard chunk.count <= remainingLength else { throw Archive.ArchiveError.unreadableArchive }
+            result.append(chunk)
+        }
+        return result
+    }
+
     static func parseCentralDirectory(data: Data,
                                       expectedEntryCount: UInt64,
                                       pathEncoding: String.Encoding?) throws -> [CentralDirectoryEntry] {
@@ -259,8 +316,11 @@ private extension RemoteArchive {
         if locatorData.count == Archive.ZIP64EndOfCentralDirectoryLocator.size {
             resolvedLocatorData = locatorData
         } else {
-            resolvedLocatorData = try await source.read(offset: locatorOffset,
-                                                       length: Archive.ZIP64EndOfCentralDirectoryLocator.size)
+            resolvedLocatorData = try await RemoteArchive.readExactly(
+                source: source,
+                offset: locatorOffset,
+                length: Archive.ZIP64EndOfCentralDirectoryLocator.size
+            )
         }
         guard let locator = Archive.ZIP64EndOfCentralDirectoryLocator(
             data: resolvedLocatorData,
@@ -268,8 +328,10 @@ private extension RemoteArchive {
         ) else { return nil }
 
         let recordOffset = locator.relativeOffsetOfZIP64EOCDRecord
-        guard recordOffset <= fileSize,
-              recordOffset + UInt64(Archive.ZIP64EndOfCentralDirectoryRecord.size) <= fileSize else { return nil }
+        let (recordEndOffset, overflow) = recordOffset.addingReportingOverflow(
+            UInt64(Archive.ZIP64EndOfCentralDirectoryRecord.size)
+        )
+        guard recordOffset <= fileSize, !overflow, recordEndOffset <= fileSize else { return nil }
 
         let recordData: Data = {
             let localStart = Int64(recordOffset) - Int64(tailOffset)
@@ -284,8 +346,11 @@ private extension RemoteArchive {
         if recordData.count == Archive.ZIP64EndOfCentralDirectoryRecord.size {
             resolvedRecordData = recordData
         } else {
-            resolvedRecordData = try await source.read(offset: recordOffset,
-                                                      length: Archive.ZIP64EndOfCentralDirectoryRecord.size)
+            resolvedRecordData = try await RemoteArchive.readExactly(
+                source: source,
+                offset: recordOffset,
+                length: Archive.ZIP64EndOfCentralDirectoryRecord.size
+            )
         }
         guard let record = Archive.ZIP64EndOfCentralDirectoryRecord(
             data: resolvedRecordData,

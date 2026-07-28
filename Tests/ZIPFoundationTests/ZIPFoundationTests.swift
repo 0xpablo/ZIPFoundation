@@ -272,7 +272,15 @@ extension ZIPFoundationTests {
             ("testRemoteArchiveExtractMatchesSynchronousArchive",
              testRemoteArchiveExtractMatchesSynchronousArchive),
             ("testRemoteArchiveExtractStreamMatchesConsumerExtract",
-             testRemoteArchiveExtractStreamMatchesConsumerExtract)
+             testRemoteArchiveExtractStreamMatchesConsumerExtract),
+            ("testRemoteArchiveExtractStreamPreservesChunksForSlowConsumer",
+             testRemoteArchiveExtractStreamPreservesChunksForSlowConsumer),
+            ("testRemoteArchiveSupportsZIP64WithShortReads",
+             testRemoteArchiveSupportsZIP64WithShortReads),
+            ("testRemoteArchiveExtractionPropagatesCancellation",
+             testRemoteArchiveExtractionPropagatesCancellation),
+            ("testRemoteArchiveRejectsMalformedZIP64RecordOffset",
+             testRemoteArchiveRejectsMalformedZIP64RecordOffset)
         ]
         #endif
         return tests + zip64Tests + darwinOnlyTests + swift5OnlyTests
