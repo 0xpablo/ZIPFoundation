@@ -212,6 +212,27 @@ public final class Archive: Sequence {
     }
     #endif
 
+    /// Initializes a new read-only ZIP `Archive` backed by a random-access `ArchiveByteSource`.
+    ///
+    /// This enables range-based access to ZIP files (e.g. HTTP Content-Range), without requiring the full archive
+    /// to be present locally, as long as the data can be fetched by `offset` and `length`.
+    ///
+    /// - Parameters:
+    ///   - byteSource: Random-access byte source that provides ZIP data by offset.
+    ///   - pathEncoding: Encoding for entry paths. Overrides the encoding specified in the archive.
+    ///                   This encoding is only used when _decoding_ paths from the receiver.
+    ///                   Paths of entries added with `addEntry` are always UTF-8 encoded.
+    public init(byteSource: ArchiveByteSource, pathEncoding: String.Encoding? = nil) throws {
+        self.url = URL(string: "bytesource://")!
+        self.accessMode = .read
+        self.pathEncoding = pathEncoding
+        let config = try Archive.makeBackingConfiguration(for: byteSource)
+        self.archiveFile = config.file
+        self.endOfCentralDirectoryRecord = config.endOfCentralDirectoryRecord
+        self.zip64EndOfCentralDirectory = config.zip64EndOfCentralDirectory
+        setvbuf(self.archiveFile, nil, _IOFBF, Int(defaultPOSIXBufferSize))
+    }
+
     deinit {
         fclose(self.archiveFile)
     }
@@ -275,26 +296,52 @@ public final class Archive: Sequence {
 
     static func scanForEndOfCentralDirectoryRecord(in file: FILEPointer)
     -> EndOfCentralDirectoryStructure? {
-        var eocdOffset: UInt64 = 0
-        var index = minEndOfCentralDirectoryOffset
         fseeko(file, 0, SEEK_END)
         let archiveLength = Int64(ftello(file))
-        guard archiveLength >= 0 else { return nil }
+        guard archiveLength >= minEndOfCentralDirectoryOffset else { return nil }
 
-        while eocdOffset == 0 && index < maxDirectoryEndOffset && index <= archiveLength {
-            fseeko(file, off_t(archiveLength - index), SEEK_SET)
-            var potentialDirectoryEndTag: UInt32 = UInt32()
-            fread(&potentialDirectoryEndTag, 1, MemoryLayout<UInt32>.size, file)
-            if potentialDirectoryEndTag == UInt32(endOfCentralDirectoryStructSignature) {
-                eocdOffset = UInt64(archiveLength - index)
-                guard let eocd: EndOfCentralDirectoryRecord = Data.readStruct(from: file, at: eocdOffset) else {
-                    return nil
+        let maxSearchLength = Swift.min(Int64(maxDirectoryEndOffset), archiveLength)
+        let tailOffset = archiveLength - maxSearchLength
+        fseeko(file, off_t(tailOffset), SEEK_SET)
+        guard let tailData = try? Data.readChunk(of: Int(maxSearchLength), from: file) else { return nil }
+        guard tailData.count >= EndOfCentralDirectoryRecord.size else { return nil }
+
+        // EOCD signature stored in little endian: 0x06054b50 -> [0x50, 0x4b, 0x05, 0x06]
+        let signature: UInt32 = UInt32(endOfCentralDirectoryStructSignature)
+
+        // Search backwards and validate using the comment length: EOCD must end exactly at EOF.
+        let maxStartIndex = tailData.count - EndOfCentralDirectoryRecord.size
+        for index in stride(from: maxStartIndex, through: 0, by: -1) {
+            let potentialSignature: UInt32 = tailData.scanValue(start: index)
+            guard potentialSignature == signature else { continue }
+
+            let commentLength: UInt16 = tailData.scanValue(start: index + 20)
+            let endIndex = index + EndOfCentralDirectoryRecord.size + Int(commentLength)
+            guard endIndex <= tailData.count else { continue }
+            guard tailOffset + Int64(endIndex) == archiveLength else { continue }
+
+            let fixedRange = index..<index + EndOfCentralDirectoryRecord.size
+            let fixedData = tailData.subdata(in: fixedRange)
+            guard let eocd = EndOfCentralDirectoryRecord(
+                data: fixedData,
+                additionalDataProvider: { additionalSize in
+                    let commentStart = index + EndOfCentralDirectoryRecord.size
+                    let commentEnd = commentStart + additionalSize
+                    if commentEnd <= tailData.count {
+                        return tailData.subdata(in: commentStart..<commentEnd)
+                    }
+                    // Fallback for truncated tail buffer (should only happen with non-standard max offsets).
+                    let absoluteOffset = tailOffset + Int64(commentStart)
+                    fseeko(file, off_t(absoluteOffset), SEEK_SET)
+                    return try Data.readChunk(of: additionalSize, from: file)
                 }
-                let zip64EOCD = scanForZIP64EndOfCentralDirectory(in: file, eocdOffset: eocdOffset)
-                return (eocd, zip64EOCD)
-            }
-            index += 1
+            ) else { continue }
+
+            let eocdOffset = UInt64(tailOffset + Int64(index))
+            let zip64EOCD = scanForZIP64EndOfCentralDirectory(in: file, eocdOffset: eocdOffset)
+            return (eocd, zip64EOCD)
         }
+
         return nil
     }
 

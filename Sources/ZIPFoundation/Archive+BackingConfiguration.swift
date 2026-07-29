@@ -82,6 +82,19 @@ extension Archive {
         }
     }
 
+    static func makeBackingConfiguration(for byteSource: ArchiveByteSource) throws
+    -> BackingConfiguration {
+        let archiveFile = try ByteSourceFile(source: byteSource).open()
+        guard let (eocdRecord, zip64EOCD) = Archive.scanForEndOfCentralDirectoryRecord(in: archiveFile) else {
+            fclose(archiveFile)
+            throw ArchiveError.missingEndOfCentralDirectoryRecord
+        }
+        fseeko(archiveFile, 0, SEEK_SET)
+        return BackingConfiguration(file: archiveFile,
+                                    endOfCentralDirectoryRecord: eocdRecord,
+                                    zip64EndOfCentralDirectory: zip64EOCD)
+    }
+
     #if swift(>=5.0)
     static func makeBackingConfiguration(for data: Data, mode: AccessMode) throws
     -> BackingConfiguration {

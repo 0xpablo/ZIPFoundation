@@ -261,6 +261,185 @@ extension Data {
 
 #endif
 
+#if swift(>=5.5)
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
+extension Data {
+    /// Decompress a stream of DEFLATE-compressed data and pass decompressed chunks to `consumer`.
+    ///
+    /// This is intended for async/network sources where compressed bytes arrive incrementally.
+    /// - Parameters:
+    ///   - bufferSize: The maximum size of the decompression buffer.
+    ///   - skipCRC32: Optional flag to skip calculation of the CRC32 checksum to improve performance.
+    ///   - stream: An `AsyncSequence` of compressed `Data` chunks.
+    ///   - consumer: An async closure that processes decompressed output chunks.
+    /// - Returns: The checksum of the decompressed output (or `0` if `skipCRC32 == true`).
+    public static func decompress<S: AsyncSequence>(bufferSize: Int,
+                                                   skipCRC32: Bool = false,
+                                                   stream: S,
+                                                   consumer: @Sendable (Data) async throws -> Void) async throws -> CRC32
+    where S.Element == Data {
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS) || os(watchOS)
+        return try await self.process(operation: COMPRESSION_STREAM_DECODE,
+                                      bufferSize: bufferSize,
+                                      skipCRC32: skipCRC32,
+                                      stream: stream,
+                                      consumer: consumer)
+        #else
+        return try await self.decode(bufferSize: bufferSize,
+                                     skipCRC32: skipCRC32,
+                                     stream: stream,
+                                     consumer: consumer)
+        #endif
+    }
+}
+
+#if os(macOS) || os(iOS) || os(tvOS) || os(visionOS) || os(watchOS)
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
+private extension Data {
+    static func process<S: AsyncSequence>(operation: compression_stream_operation,
+                                         bufferSize: Int,
+                                         skipCRC32: Bool,
+                                         stream: S,
+                                         consumer: @Sendable (Data) async throws -> Void) async throws -> CRC32
+    where S.Element == Data {
+        var crc32 = CRC32(0)
+        let destPointer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { destPointer.deallocate() }
+        let streamPointer = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { streamPointer.deallocate() }
+        var compressionStream = streamPointer.pointee
+        var status = compression_stream_init(&compressionStream, operation, COMPRESSION_ZLIB)
+        guard status != COMPRESSION_STATUS_ERROR else { throw CompressionError.invalidStream }
+        defer { compression_stream_destroy(&compressionStream) }
+
+        compressionStream.src_size = 0
+        compressionStream.dst_ptr = destPointer
+        compressionStream.dst_size = bufferSize
+
+        var iterator = stream.makeAsyncIterator()
+        var sourceData: Data? = nil
+        var isFinal = false
+
+        repeat {
+            if compressionStream.src_size == 0, !isFinal {
+                sourceData = try await iterator.next()
+                if sourceData == nil { isFinal = true }
+                compressionStream.src_size = sourceData?.count ?? 0
+            }
+
+            if let current = sourceData, current.count > 0 {
+                current.withUnsafeBytes { rawBufferPointer in
+                    if let baseAddress = rawBufferPointer.baseAddress {
+                        let pointer = baseAddress.assumingMemoryBound(to: UInt8.self)
+                        compressionStream.src_ptr = pointer.advanced(by: current.count - compressionStream.src_size)
+                        let flags = isFinal ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0
+                        status = compression_stream_process(&compressionStream, flags)
+                    }
+                }
+            } else {
+                let flags = Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
+                status = compression_stream_process(&compressionStream, flags)
+            }
+
+            switch status {
+            case COMPRESSION_STATUS_OK, COMPRESSION_STATUS_END:
+                let produced = bufferSize - compressionStream.dst_size
+                if produced > 0 {
+                    let outputData = Data(bytesNoCopy: destPointer, count: produced, deallocator: .none)
+                    try await consumer(outputData)
+                    if operation == COMPRESSION_STREAM_DECODE && !skipCRC32 { crc32 = outputData.crc32(checksum: crc32) }
+                }
+                compressionStream.dst_ptr = destPointer
+                compressionStream.dst_size = bufferSize
+            default:
+                throw CompressionError.corruptedData
+            }
+        } while status == COMPRESSION_STATUS_OK
+
+        return crc32
+    }
+}
+
+#else
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
+private extension Data {
+    static func decode<S: AsyncSequence>(bufferSize: Int,
+                                        skipCRC32: Bool,
+                                        stream: S,
+                                        consumer: @Sendable (Data) async throws -> Void) async throws -> CRC32
+    where S.Element == Data {
+        var zlibStream = z_stream()
+        let streamSize = Int32(MemoryLayout<z_stream>.size)
+        var result = inflateInit2_(&zlibStream, -MAX_WBITS, ZLIB_VERSION, streamSize)
+        defer { inflateEnd(&zlibStream) }
+        guard result == Z_OK else { throw CompressionError.invalidStream }
+
+        var unzipCRC32 = CRC32(0)
+        var iterator = stream.makeAsyncIterator()
+        var reachedEndOfInput = false
+
+        while result != Z_STREAM_END {
+            var inputChunk = Data()
+            if !reachedEndOfInput {
+                if let next = try await iterator.next() {
+                    inputChunk = next
+                } else {
+                    reachedEndOfInput = true
+                }
+            }
+
+            let flush: Int32 = reachedEndOfInput ? Z_FINISH : Z_NO_FLUSH
+            zlibStream.avail_in = UInt32(inputChunk.count)
+            var producedChunks: [Data] = []
+
+            try inputChunk.withUnsafeMutableBytes { rawBufferPointer in
+                if let baseAddress = rawBufferPointer.baseAddress, rawBufferPointer.count > 0 {
+                    zlibStream.next_in = baseAddress.assumingMemoryBound(to: UInt8.self)
+                } else {
+                    zlibStream.next_in = nil
+                }
+
+                repeat {
+                    var outputData = Data(count: bufferSize)
+                    zlibStream.avail_out = UInt32(bufferSize)
+                    try outputData.withUnsafeMutableBytes { outBufferPointer in
+                        guard let outBase = outBufferPointer.baseAddress, outBufferPointer.count > 0 else {
+                            throw CompressionError.corruptedData
+                        }
+                        zlibStream.next_out = outBase.assumingMemoryBound(to: UInt8.self)
+                        result = inflate(&zlibStream, flush)
+                        guard result != Z_NEED_DICT && result != Z_DATA_ERROR && result != Z_MEM_ERROR else {
+                            throw CompressionError.corruptedData
+                        }
+                    }
+                    let produced = bufferSize - Int(zlibStream.avail_out)
+                    outputData.count = produced
+                    if outputData.count > 0 {
+                        producedChunks.append(outputData)
+                    }
+                } while zlibStream.avail_out == 0 && result != Z_STREAM_END
+            }
+
+            for output in producedChunks {
+                try await consumer(output)
+                if !skipCRC32 { unzipCRC32 = output.crc32(checksum: unzipCRC32) }
+            }
+
+            if reachedEndOfInput, inputChunk.isEmpty, producedChunks.isEmpty, result != Z_STREAM_END {
+                throw CompressionError.corruptedData
+            }
+        }
+        return unzipCRC32
+    }
+}
+
+#endif
+
+#endif
+
 /// The lookup table used to calculate `CRC32` checksums when using the built-in
 /// CRC32 implementation.
 private let crcTable: [CRC32] = [

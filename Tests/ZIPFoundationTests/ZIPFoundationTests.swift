@@ -183,7 +183,7 @@ extension ZIPFoundationTests {
     }
 
     static var allTests: [(String, (ZIPFoundationTests) -> () throws -> Void)] {
-        return [
+        var tests: [(String, (ZIPFoundationTests) -> () throws -> Void)] = [
             ("testArchiveAddEntryErrorConditions", testArchiveAddEntryErrorConditions),
             ("testArchiveCreateErrorConditions", testArchiveCreateErrorConditions),
             ("testArchiveInvalidEOCDRecordConditions", testArchiveInvalidEOCDRecordConditions),
@@ -225,6 +225,15 @@ extension ZIPFoundationTests {
             ("testExtractUncompressedDataDescriptorArchive", testExtractUncompressedDataDescriptorArchive),
             ("testExtractUncompressedFolderEntries", testExtractUncompressedFolderEntries),
             ("testExtractUncompressedEmptyFile", testExtractUncompressedEmptyFile),
+            ("testByteSourceArchiveInitReadsOnlyTailWindow", testByteSourceArchiveInitReadsOnlyTailWindow),
+            ("testExtractEntriesFromByteSourceArchive", testExtractEntriesFromByteSourceArchive),
+            ("testEOCDScanIgnoresSignatureInEntryData", testEOCDScanIgnoresSignatureInEntryData),
+            ("testCentralDirectoryEntriesFromByteSourceAvoidLocalHeaderReads",
+             testCentralDirectoryEntriesFromByteSourceAvoidLocalHeaderReads),
+            ("testCentralDirectoryLookupFromByteSourceAvoidLocalHeaderReads",
+             testCentralDirectoryLookupFromByteSourceAvoidLocalHeaderReads),
+            ("testMaterializeEntryFromCentralDirectoryEntryReadsLocalHeader",
+             testMaterializeEntryFromCentralDirectoryEntryReadsLocalHeader),
             ("testFileAttributeHelperMethods", testFileAttributeHelperMethods),
             ("testFilePermissionHelperMethods", testFilePermissionHelperMethods),
             ("testFileSizeHelperMethods", testFileSizeHelperMethods),
@@ -255,7 +264,26 @@ extension ZIPFoundationTests {
             ("testFileModificationDate", testFileModificationDate),
             ("testFileModificationDateHelperMethods", testFileModificationDateHelperMethods),
             ("testInvalidSymlinkCompressionMethodErrorConditions", testInvalidSymlinkCompressionMethodErrorConditions)
-        ] + zip64Tests + darwinOnlyTests + swift5OnlyTests
+        ]
+        #if swift(>=5.5)
+        tests += [
+            ("testRemoteArchiveOpenReadsTailAndCentralDirectory",
+             testRemoteArchiveOpenReadsTailAndCentralDirectory),
+            ("testRemoteArchiveExtractMatchesSynchronousArchive",
+             testRemoteArchiveExtractMatchesSynchronousArchive),
+            ("testRemoteArchiveExtractStreamMatchesConsumerExtract",
+             testRemoteArchiveExtractStreamMatchesConsumerExtract),
+            ("testRemoteArchiveExtractStreamPreservesChunksForSlowConsumer",
+             testRemoteArchiveExtractStreamPreservesChunksForSlowConsumer),
+            ("testRemoteArchiveSupportsZIP64WithShortReads",
+             testRemoteArchiveSupportsZIP64WithShortReads),
+            ("testRemoteArchiveExtractionPropagatesCancellation",
+             testRemoteArchiveExtractionPropagatesCancellation),
+            ("testRemoteArchiveRejectsMalformedZIP64RecordOffset",
+             testRemoteArchiveRejectsMalformedZIP64RecordOffset)
+        ]
+        #endif
+        return tests + zip64Tests + darwinOnlyTests + swift5OnlyTests
     }
 
     static var zip64Tests: [(String, (ZIPFoundationTests) -> () throws -> Void)] {
